@@ -1,0 +1,16 @@
+{
+  "name": "agent-workbench",
+  "private": true,
+  "main": "electron/main.cjs",
+  "workspaces": ["backend", "frontend"],
+  "scripts": {
+    "test": "npm -w backend test && npm -w frontend test",
+    "dev": "concurrently \"npm -w backend run dev\" \"npm -w frontend run dev\"",
+    "desktop:build": "npm -w frontend run build",
+    "desktop": "npm run desktop:build && electron ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0",
+    "electron": "^33.0.0"
+  }
+}

@@ -1,0 +1,37 @@
+# Agent Workbench
+
+Agent Workbench 是 Windows 上的本地桌面工作台。它汇总多个智能体的会话，按项目浏览历史，并在原客户端打开指定会话。协作任务可以将一个需求拆成多项工作，交给配置好的智能体执行。
+
+## 安装与启动
+
+建议使用 Node.js 24 或更新版本，并安装需要使用的智能体客户端。在项目目录运行：
+
+```powershell
+npm ci
+npm run desktop
+```
+
+首次安装会下载 Electron。要从桌面或开始菜单启动，先运行 `build-desktop.cmd` 构建界面，再运行 `create-shortcut.cmd` 创建快捷方式。拉取代码更新后，重新运行 `build-desktop.cmd`。工作台启动时会自动启动本机后端，默认监听 `127.0.0.1:4178`。
+
+## 会话浏览与定位
+
+- 可按项目和来源筛选，搜索标题或路径，查看消息、工具记录及可用的模型和用量信息。较长内容可折叠或展开。
+- 消息左侧的导航轨按用户回合显示刻度。悬停可预览回合，点击可跳到对应消息。
+- 设置中可以调整来源显示和归档记录。归档只在工作台中隐藏会话，不删除原端数据。
+- 点会话标题旁的客户端按钮即可打开。Codex、WorkBuddy 和带会话深链接补丁的 DeepSeek Harness 通过桌面协议定位。Claude Code 和 pi 在 PowerShell 中通过 CLI 续接。
+- OpenCode 和 Antigravity 提供 **Desktop** 和 **CLI** 入口。Desktop 通过原应用的搜索按 ID 定位。无法确认定位时，工作台复制 ID 供手动查找。
+- OpenCode 的 V2 会话优先使用桌面端随附的 CLI。Antigravity 的 CLI 原生会话可以直接续接，桌面会话也可通过 **CLI 导入**后在 `/resume` → **Other** 导入副本。
+- 自定义安装位置可通过 `CODEX_EXECUTABLE`、`AW_OPENCODE_DESKTOP`、`AW_ANTIGRAVITY_DESKTOP` 或 `AW_AGY_CLI` 指定。安装或修改 PATH 后请重新启动工作台。
+
+## 协作任务
+
+在 **协作任务** 中选择工作区和 Leader，输入需求后启动协作。也可以手动配置分工。工作台显示各分工的进度和相关会话，能够打开时可跳回原客户端。
+
+协作工作文件保存在 `workspace/` 中。任务共享信息写入 `SHARED.md`，分工结果记录在各自的 `RESULT.md`。完成标记由执行任务的智能体生成，验收前应核对实际产出。
+
+## 数据与开发
+
+- Git 仓库包含源代码、说明和测试数据。API 密钥、智能体账号及原端会话由各客户端在本机管理。
+- 本机任务数据库、日志和协作产物不纳入 Git。跳转定位和会话浏览不要求在工作台中配置 API 密钥。
+- `backend/` 提供本机接口、会话读取和任务调度。`frontend/` 是界面。`electron/` 提供桌面启动及客户端定位。
+- `npm run dev` 用于开发调试。`npm test` 运行前后端测试。
