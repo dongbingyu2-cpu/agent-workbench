@@ -3,6 +3,7 @@ import type { Agent, AgentKind, CatalogModel, DirListing, PartDraft, PartProgres
 import { statusKey, translate } from '../i18n';
 import { AgentIcon, agentName } from './AgentIcon';
 import { CollapsibleText } from './CollapsibleText';
+import { TaskFlowTree } from './TaskFlowTree';
 import { pathTail, shortPath } from '../format';
 
 export interface PartDraftRow {
@@ -14,7 +15,7 @@ export interface PartDraftRow {
   dependsOn: string;
 }
 
-type DetailTab = 'all' | 'tree' | 'output';
+type DetailTab = 'all' | 'flow' | 'tree' | 'output';
 
 function statusLabel(status: string): string {
   return translate('zh', statusKey(status));
@@ -612,30 +613,31 @@ export function TaskPanel({
         </div>
       </header>
 
-      {task.status !== 'planned' && (
-        <div className="tabs-row">
-          <div className="tabs" role="tablist" aria-label="任务视图筛选">
-            {([
-              { key: 'all', label: '全部', count: totalParts },
-              { key: 'tree', label: '依赖树', count: totalParts },
-              { key: 'output', label: '执行输出', count: progress.length },
-            ] as Array<{ key: DetailTab; label: string; count: number }>).map((item) => (
-              <button
-                key={item.key}
-                type="button"
-                role="tab"
-                aria-selected={detailTab === item.key}
-                className={detailTab === item.key ? 'chosen' : ''}
-                onClick={() => setDetailTab(item.key)}
-              >
-                {item.label}
-                <span className="tab-count">{item.count}</span>
-              </button>
-            ))}
-          </div>
-          <div className="tabs-count">{totalParts > 0 ? `${doneParts}/${totalParts} 完成（${pct}%）` : '暂无分片'}</div>
+      <div className="tabs-row">
+        <div className="tabs" role="tablist" aria-label="任务视图筛选">
+          {([
+            { key: 'all', label: '全部', count: totalParts },
+            { key: 'flow', label: '流程树' },
+            { key: 'tree', label: '依赖树', count: totalParts },
+            { key: 'output', label: '执行输出', count: progress.length },
+          ] as Array<{ key: DetailTab; label: string; count?: number }>)
+            .filter(({ key }) => task.status !== 'planned' || key === 'all' || key === 'flow')
+            .map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              role="tab"
+              aria-selected={detailTab === item.key}
+              className={detailTab === item.key ? 'chosen' : ''}
+              onClick={() => setDetailTab(item.key)}
+            >
+              {item.label}
+              {item.count !== undefined && <span className="tab-count">{item.count}</span>}
+            </button>
+          ))}
         </div>
-      )}
+        <div className="tabs-count">{totalParts > 0 ? `${doneParts}/${totalParts} 完成（${pct}%）` : '暂无分片'}</div>
+      </div>
 
       {localError && (
         <div className="error" role="alert">
@@ -646,6 +648,9 @@ export function TaskPanel({
 
       <div className="task-scroll">
         <div className="task-inner">
+          {detailTab === 'flow' && (
+            <TaskFlowTree key={task.id} task={task} agents={assignableAgents} progress={progressByPartId} drafts={parts} summary={summary} />
+          )}
           {detailTab === 'all' && (
             <article className="message user">
               <div className="message-head">
@@ -663,7 +668,7 @@ export function TaskPanel({
             </details>
           )}
 
-          {task.status === 'planned' && parts.length === 0 && (
+          {detailTab === 'all' && task.status === 'planned' && parts.length === 0 && (
             <article className="message assistant">
               <div className="message-head">
                 <span className="role-tag assistant">Leader</span>
@@ -675,7 +680,7 @@ export function TaskPanel({
             </article>
           )}
 
-          {task.status === 'planned' && parts.length > 0 && (
+          {detailTab === 'all' && task.status === 'planned' && parts.length > 0 && (
             <article className="message assistant">
               <div className="message-head">
                 <span className="role-tag assistant">分片方案</span>

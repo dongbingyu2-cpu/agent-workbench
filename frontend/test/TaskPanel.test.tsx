@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { TaskPanel } from '../src/components/TaskPanel';
 
@@ -143,6 +143,54 @@ it('reflects live part progress in the overview and task tree', () => {
   expect(screen.getByText('checking styles...')).toBeInTheDocument();
   expect(screen.getByRole('tab', { name: /依赖树/ })).toBeInTheDocument();
   expect(screen.getByRole('tab', { name: /执行输出/ })).toBeInTheDocument();
+});
+
+it('shows the workflow by round and keeps dependencies in a separate view', () => {
+  const task = {
+    id: 'example', title: '协作示例', description: '本轮检查页面', workspacePath: '', status: 'active',
+    round: 2, previousRequirements: ['首轮搭建页面'],
+    parts: [
+      { id: 'first', taskId: 'example', title: '搭建页面', description: '实现界面', assignedAgentId: 'c', status: 'done', resultPath: '', doneMarker: '' },
+      { id: 'second', taskId: 'example', title: '检查页面', description: '校验样式', assignedAgentId: 'o', status: 'pending', resultPath: '', doneMarker: '', round: 2 },
+    ],
+  } as const;
+  const props = makeProps({
+    task: { ...task, previousRequirements: [...task.previousRequirements], parts: [...task.parts] },
+    progress: [
+      { partId: 'first', status: 'done', tail: '', resultPath: '', result: '已搭建基本页面' },
+      { partId: 'second', status: 'running', tail: '', resultPath: '' },
+    ],
+  });
+  render(<TaskPanel {...props} />);
+
+  fireEvent.click(screen.getByRole('tab', { name: '流程树' }));
+  const flow = within(screen.getByRole('region', { name: '协作流程树' }));
+  expect(flow.getByText('本轮检查页面')).toBeVisible();
+  expect(flow.getByText('检查页面').closest('li')).toHaveTextContent('运行中');
+  expect(flow.queryByText('首轮搭建页面')).not.toBeInTheDocument();
+  const previous = flow.getByRole('button', { name: /第 1 轮/ });
+  fireEvent.click(previous);
+  expect(previous).toHaveAttribute('aria-expanded', 'true');
+  expect(flow.getByText('首轮搭建页面')).toBeVisible();
+  fireEvent.click(flow.getByText('搭建页面', { selector: 'summary' }));
+  expect(flow.getByText('已搭建基本页面')).toBeVisible();
+
+  fireEvent.click(screen.getByRole('tab', { name: /依赖树/ }));
+  expect(screen.getByRole('heading', { name: '依赖树' })).toBeVisible();
+  expect(screen.queryByRole('region', { name: '协作流程树' })).not.toBeInTheDocument();
+});
+
+it('shows the requirement and draft assignments in the workflow before dispatch', () => {
+  const task = { id: 'example', title: '协作示例', description: '准备验证报告', workspacePath: '', status: 'planned', parts: [] } as const;
+  render(<TaskPanel {...makeProps({
+    task: { ...task, parts: [] },
+    parts: [{ title: '测试界面', description: '检查布局', agentId: 'c', model: '', phase: 'test', dependsOn: '' }],
+  })} />);
+  fireEvent.click(screen.getByRole('tab', { name: '流程树' }));
+  const flow = within(screen.getByRole('region', { name: '协作流程树' }));
+  expect(flow.getByText('准备验证报告')).toBeVisible();
+  expect(flow.getByRole('heading', { name: '分工方案' })).toBeVisible();
+  expect(flow.getByText('测试界面').closest('li')).toHaveTextContent('待派发');
 });
 
 it('shows pause/cancel buttons for active tasks and resume/cancel for paused tasks', () => {
