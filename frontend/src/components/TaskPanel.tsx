@@ -122,6 +122,7 @@ export function TaskPanel({
   onDelete,
   onPause,
   onResume,
+  onFollowUp,
   onCancel,
   onParts,
   onStart,
@@ -152,6 +153,7 @@ export function TaskPanel({
   onDelete: () => void;
   onPause?: () => void;
   onResume?: () => void;
+  onFollowUp?: (taskId: string, note: string, round: number) => Promise<void>;
   onCancel?: () => void;
   onParts: (parts: PartDraftRow[]) => void;
   onStart: (assignments: Array<{ title: string; description: string; agent: Agent; model?: string; dependsOn?: string; phase?: 'coding' | 'review' | 'test' }>, leader: Agent | undefined) => void;
@@ -161,8 +163,8 @@ export function TaskPanel({
   onOpenAgent: (kind: AgentKind, id: string, project?: string, partTitle?: string) => void;
   onNewTask?: () => void;
   onLoadDirs?: (dir?: string) => Promise<DirListing[]>;
-  onCompleteRequirement?: (taskId: string, agent: Agent) => Promise<string>;
-  onPlan?: (taskId: string, agent: Agent) => Promise<PartDraft[]>;
+  onCompleteRequirement?: (taskId: string, agent: Agent, description: string) => Promise<string>;
+  onPlan?: (taskId: string, agent: Agent, description: string) => Promise<PartDraft[]>;
   onLoadModels?: (kind: AgentKind) => Promise<CatalogModel[]>;
 }) {
   const [dirs, setDirs] = useState<DirListing[]>([]);
@@ -170,6 +172,7 @@ export function TaskPanel({
   const [dirsLoading, setDirsLoading] = useState(false);
   const [leaderId, setLeaderId] = useState(task?.leaderAgentId ?? '');
   const [followUp, setFollowUp] = useState('');
+  const [sendingFollowUp, setSendingFollowUp] = useState(false);
   const [busyPlan, setBusyPlan] = useState(false);
   const [busyComplete, setBusyComplete] = useState(false);
   const [localError, setLocalError] = useState('');
@@ -185,7 +188,7 @@ export function TaskPanel({
     setLocalError('');
     setCopiedKey('');
     setDetailTab('all');
-  }, [task?.id, task?.leaderAgentId]);
+  }, [task?.id, task?.round, task?.leaderAgentId]);
 
   const cliAgents = buildLeaderAgents(agents);
   const assignableAgents = buildAssignableAgents(agents);
@@ -263,6 +266,20 @@ export function TaskPanel({
     return updated;
   };
 
+  const submitFollowUp = async () => {
+    const note = followUp.trim();
+    if (task?.status !== 'done' || !onFollowUp || !note || sendingFollowUp) return;
+    setSendingFollowUp(true);
+    setLocalError('');
+    try {
+      await onFollowUp(task.id, note, task.round ?? 1);
+    } catch (err) {
+      setLocalError(errorMessage(err, '追加要求失败'));
+    } finally {
+      setSendingFollowUp(false);
+    }
+  };
+
   const completeRequirement = async () => {
     if (!leader || !task) return;
     const activeTask = mergeFollowUpIntoTask() ?? task;
@@ -271,12 +288,12 @@ export function TaskPanel({
     try {
       let completed = '';
       if (onCompleteRequirement) {
-        completed = await onCompleteRequirement(activeTask.id, leader);
+        completed = await onCompleteRequirement(activeTask.id, leader, activeTask.description);
       } else {
         const response = await fetch(`/api/tasks/${activeTask.id}/complete-requirement`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ agent: leader }),
+          body: JSON.stringify({ agent: leader, description: activeTask.description }),
         });
         if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || '补全需求失败');
         const data = (await response.json()) as { requirement: string };
@@ -299,12 +316,12 @@ export function TaskPanel({
     try {
       let drafts: PartDraft[] = [];
       if (onPlan) {
-        drafts = await onPlan(activeTask.id, leader);
+        drafts = await onPlan(activeTask.id, leader, activeTask.description);
       } else {
         const response = await fetch(`/api/tasks/${activeTask.id}/plan`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ agent: leader }),
+          body: JSON.stringify({ agent: leader, description: activeTask.description }),
         });
         if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || '拆分分工失败');
         drafts = (await response.json()) as PartDraft[];
@@ -503,10 +520,12 @@ export function TaskPanel({
   }
 
   const progressByPartId = new Map(progress.map((item) => [item.partId, item]));
-  const totalParts = task.parts.length;
-  const doneParts = task.parts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'done').length;
-  const runningParts = task.parts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'running').length;
-  const failedParts = task.parts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'failed').length;
+  const round = task.round ?? 1;
+  const currentParts = task.parts.filter((part) => (part.round ?? 1) === round);
+  const totalParts = currentParts.length;
+  const doneParts = currentParts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'done').length;
+  const runningParts = currentParts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'running').length;
+  const failedParts = currentParts.filter((part) => (progressByPartId.get(part.id)?.status ?? part.status) === 'failed').length;
   const pct = totalParts > 0 ? Math.round((doneParts / totalParts) * 100) : 0;
   const taskLeader = (task.leaderAgentId ? assignableAgents.find((agent) => agent.id === task.leaderAgentId) : undefined) ?? leader;
   const showTree = detailTab === 'all' || detailTab === 'tree';
@@ -536,6 +555,7 @@ export function TaskPanel({
             <div className="task-title-line">
               <h1>{task.title}</h1>
               <span className={`badge ${task.status}`}>{statusLabel(task.status)}</span>
+              {round > 1 && <span className="tool-name">第 {round} 轮</span>}
             </div>
             <div className="head-path" title={task.workspacePath}>
               {shortPath(task.workspacePath) || '默认工作区'}
@@ -629,12 +649,18 @@ export function TaskPanel({
           {detailTab === 'all' && (
             <article className="message user">
               <div className="message-head">
-                <span className="role-tag user">需求</span>
+                <span className="role-tag user">{round > 1 ? '本轮需求' : '需求'}</span>
               </div>
               <div className="message-body">
                 {task.description ? <CollapsibleText text={task.description} /> : task.title}
               </div>
             </article>
+          )}
+          {detailTab === 'all' && Boolean(task.previousRequirements?.length) && (
+            <details className="part-log-details">
+              <summary>查看之前的需求</summary>
+              <CollapsibleText text={task.previousRequirements!.map((text, index) => `第 ${index + 1} 轮\n${text}`).join('\n\n')} />
+            </details>
           )}
 
           {task.status === 'planned' && parts.length === 0 && (
@@ -785,7 +811,7 @@ export function TaskPanel({
               <div className="progress-bar-track" aria-label={`任务总进度 ${pct}%`}>
                 <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
               </div>
-              <TaskTree parts={task.parts} progress={progress} agents={agents} />
+              <TaskTree parts={currentParts} progress={progress} agents={agents} />
             </section>
           )}
 
@@ -801,7 +827,7 @@ export function TaskPanel({
             </article>
           )}
 
-          {task.status !== 'planned' && showOutput && (
+          {(task.status !== 'planned' || task.parts.length > 0) && showOutput && (
             <section className="task-section">
               <div className="section-head">
                 <h2>执行输出与结果</h2>
@@ -827,6 +853,7 @@ export function TaskPanel({
                       <div className="message-head">
                         <span className={`badge ${part.status}`}>{statusLabel(part.status)}</span>
                         <strong className="progress-title">{pt?.title || part.partId.slice(0, 8)}</strong>
+                        {round > 1 && pt && <span className="tool-name">第 {pt.round ?? 1} 轮</span>}
                         {agent && (
                           <span className="source-badge">
                             <AgentIcon kind={agent.kind} />
@@ -915,6 +942,33 @@ export function TaskPanel({
           )}
         </div>
       </div>
+
+      {task.status === 'done' && onFollowUp && (
+        <div className="composer task-docked-composer">
+          <form className="composer-card task-composer" onSubmit={(event) => { event.preventDefault(); void submitFollowUp(); }}>
+            <textarea
+              value={followUp}
+              onChange={(event) => setFollowUp(event.target.value)}
+              disabled={sendingFollowUp}
+              placeholder="输入追加要求，继续在此工作区完成下一轮…"
+              aria-label="追加任务要求"
+              rows={2}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void submitFollowUp();
+                }
+              }}
+            />
+            <div className="composer-bar task-composer-bar">
+              <span className="spacer" />
+              <button type="submit" className="btn btn-primary task-dispatch-btn" disabled={!followUp.trim() || sendingFollowUp}>
+                {sendingFollowUp ? '正在追加…' : '开始下一轮'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {task.status === 'planned' && (
         <div className="composer task-docked-composer">

@@ -8,6 +8,7 @@ import { isExternalSessionKind } from '../agents/types';
 import type { Orchestrator } from '../tasks/orchestrator';
 import type { Planner } from '../tasks/planner';
 import type { TaskStore } from '../tasks/store';
+import { taskSummaryPath } from '../tasks/context';
 import type { SessionStore } from '../sessions/eventLog';
 import type { SessionEvent } from '../agents/types';
 import type { CodexAppServer } from '../agents/codexAppServer';
@@ -251,6 +252,17 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     return reply.send({ ok: true });
   });
 
+  app.post('/api/tasks/:id/follow-up', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const task = deps.store.getTask(id);
+    if (!task) return reply.code(404).send({ error: 'task not found' });
+    const { description, round } = (req.body ?? {}) as { description?: unknown; round?: number };
+    if (typeof description !== 'string' || !description.trim()) return reply.code(400).send({ error: '请输入追加要求' });
+    const updated = (round === undefined || round === (task.round ?? 1)) && deps.store.beginFollowUp(id, description.trim());
+    if (!updated) return reply.code(409).send({ error: '仅当前已完成的一轮可追加要求' });
+    return reply.send(updated);
+  });
+
   app.post('/api/tasks/:id/cancel', async (req, reply) => {
     const { id } = req.params as { id: string };
     const task = deps.store.getTask(id);
@@ -274,10 +286,16 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const { id } = req.params as { id: string };
     const task = deps.store.getTask(id);
     if (!task) return reply.code(404).send({ error: 'task not found' });
-    const { agent } = req.body as { agent: Agent };
+    const { agent, description } = (req.body ?? {}) as { agent?: Agent; description?: string };
+    if (!agent) return reply.code(400).send({ error: '请先选择 leader 智能体' });
+    if (task.status !== 'planned') return reply.code(409).send({ error: '仅待派发的任务可拆分' });
     if (isExternalSessionKind(agent.kind)) return reply.code(409).send({ error: desktopOnly });
-    const drafts = await deps.planner.requestSplitPlan(task, agent);
+    const requirement = typeof description === 'string' ? description : task.description;
+    const drafts = await deps.planner.requestSplitPlan({ ...task, description: requirement }, agent);
+    const current = deps.store.getTask(id);
+    if (current?.status !== 'planned' || current.round !== task.round) return reply.code(409).send({ error: '任务状态已变化，请重新打开' });
     deps.store.updateTaskLeader(id, agent.id);
+    deps.store.updateTaskDescription?.(id, requirement);
     return reply.send(drafts);
   });
 
@@ -285,11 +303,14 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const { id } = req.params as { id: string };
     const task = deps.store.getTask(id);
     if (!task) return reply.code(404).send({ error: 'task not found' });
-    const { agent } = req.body as { agent: Agent };
+    const { agent, description } = (req.body ?? {}) as { agent?: Agent; description?: string };
     if (!agent) return reply.code(400).send({ error: '请先选择 leader 智能体' });
+    if (task.status !== 'planned') return reply.code(409).send({ error: '仅待派发的任务可补全需求' });
     if (isExternalSessionKind(agent.kind)) return reply.code(409).send({ error: desktopOnly });
     if (!deps.planner.completeRequirement) return reply.code(501).send({ error: '当前 planner 不支持补全需求' });
-    const requirement = await deps.planner.completeRequirement(task, agent);
+    const requirement = await deps.planner.completeRequirement({ ...task, description: typeof description === 'string' ? description : task.description }, agent);
+    const current = deps.store.getTask(id);
+    if (current?.status !== 'planned' || current.round !== task.round) return reply.code(409).send({ error: '任务状态已变化，请重新打开' });
     deps.store.updateTaskLeader(id, agent.id);
     deps.store.updateTaskDescription?.(id, requirement);
     return reply.send({ requirement });
@@ -299,15 +320,19 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const { id } = req.params as { id: string };
     const task = deps.store.getTask(id);
     if (!task) return reply.code(404).send({ error: 'task not found' });
-    if (task.status !== 'planned' || task.parts.length > 0) return reply.code(409).send({ error: '任务已派发，不能重复派发' });
-    const { parts, leaderAgent } = req.body as {
+    const currentRound = task.round ?? 1;
+    const { parts, leaderAgent, round, description } = (req.body ?? {}) as {
       parts: Array<{ title: string; description: string; agent: Agent; model?: string; dependsOn?: string; phase?: 'coding' | 'review' | 'test' }>;
       leaderAgent?: Agent;
+      round?: number;
+      description?: string;
     };
+    if (task.status !== 'planned' || (round !== undefined && round !== currentRound)) return reply.code(409).send({ error: '任务已派发或轮次已变化' });
     if (!Array.isArray(parts) || parts.length === 0 || parts.some((part) => !part.agent || !part.title?.trim() || !part.description?.trim())) return reply.code(400).send({ error: '请填写完整分工并选择智能体' });
     if (leaderAgent && isExternalSessionKind(leaderAgent.kind)) return reply.code(409).send({ error: desktopOnly });
-    const created = parts.map((p) => {
-      const part = deps.store.addPart(id, {
+    let created;
+    try {
+      created = deps.store.confirmRound(id, currentRound, parts.map((p) => ({
         title: p.title,
         description: p.description,
         assignedAgentId: p.agent.id,
@@ -316,11 +341,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         status: 'pending',
         model: p.model && p.model.trim() ? p.model.trim() : null,
         dependsOn: p.dependsOn && p.dependsOn.trim() ? p.dependsOn.trim() : null,
-      });
-      return { part, agent: p.agent };
-    });
-    if (leaderAgent) deps.store.updateTaskLeader(id, leaderAgent.id);
-    deps.orchestrator.activateTask(id, created, leaderAgent);
+      })), leaderAgent?.id, typeof description === 'string' ? description : undefined);
+    } catch {
+      return reply.code(500).send({ error: '分工准备失败，请检查工作区是否可写后重试' });
+    }
+    if (!created) return reply.code(409).send({ error: '本轮已经派发' });
+    deps.orchestrator.activateTask(id, created.map((part, index) => ({ part, agent: parts[index]!.agent })), leaderAgent);
     return { ok: true };
   });
 
@@ -335,7 +361,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const task = deps.store.getTask(id);
     if (!task) return reply.code(404).send({ error: 'task not found' });
     const sharedFile = path.join(task.workspacePath, 'SHARED.md');
-    const summaryFile = path.join(task.workspacePath, 'SUMMARY.md');
+    const summaryFile = taskSummaryPath(task);
     const shared = existsSync(sharedFile) ? readFileSync(sharedFile, 'utf8') : '';
     const summary = existsSync(summaryFile) ? readFileSync(summaryFile, 'utf8') : '';
     return { path: task.workspacePath, entries: listDir(task.workspacePath), shared, summary };

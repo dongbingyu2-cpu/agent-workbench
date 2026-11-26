@@ -287,24 +287,31 @@ export function App() {
       setTaskSummary('');
       return;
     }
-    const fetchSummary = () => client.taskWorkspace(task.id).then((ws) => setTaskSummary(ws.summary ?? '')).catch(() => {});
+    let current = true;
+    const fetchSummary = () => client.taskWorkspace(task.id).then((ws) => {
+      if (current) setTaskSummary(ws.summary ?? '');
+    }).catch(() => {});
     const update = () => client.progress(task.id).then((items) => {
+      if (!current) return;
       setProgress(items);
       if (items.length > 0 && task.status === 'active' && items.every((item) => item.status === 'done' || item.status === 'failed')) {
         client.listTasks().then((list) => {
+          if (!current) return;
           setTasks(list);
           const refreshed = list.find((item) => item.id === task.id);
-          if (refreshed) setTask(refreshed);
+          if (refreshed && refreshed.status !== task.status) setTask(refreshed);
         }).catch(() => {});
         void fetchSummary();
       }
-    }).catch((err) => setError(String(err)));
+    }).catch((err) => { if (current) setError(String(err)); });
     void update();
     if (task.status === 'done') void fetchSummary();
     else setTaskSummary('');
-    if (task.status !== 'active') return;
-    const timer = setInterval(update, 2000);
-    return () => clearInterval(timer);
+    const timer = task.status === 'active' ? setInterval(update, 2000) : undefined;
+    return () => {
+      current = false;
+      clearInterval(timer);
+    };
   }, [task]);
 
   const archivedSessionSet = useMemo(() => new Set(archivedSessions), [archivedSessions]);
@@ -539,11 +546,19 @@ export function App() {
     await refreshActiveTask(task.id);
   });
   const startParts = (assignments: Array<{ title: string; description: string; agent: Agent; model?: string; dependsOn?: string; phase?: 'coding' | 'review' | 'test' }>, leader: Agent | undefined) => task && run(async () => {
-    await client.confirm(task.id, assignments, leader);
+    await client.confirm(task.id, assignments, leader, { round: task.round ?? 1, description: task.description });
     const list = await client.listTasks();
     setTasks(list);
     setTask(list.find((item) => item.id === task.id) ?? { ...task, status: 'active' });
   });
+  const followUpTask = async (taskId: string, note: string, round: number) => {
+    const reopened = await client.followUpTask(taskId, note, round);
+    setTasks((old) => old.map((item) => item.id === taskId ? reopened : item));
+    setTask((active) => active?.id === taskId ? reopened : active);
+  };
+
+  // 每次打开任务或切到下一轮时，清理上一次尚未派发的分工草稿。
+  useEffect(() => { setParts([]); }, [task?.id, task?.round]);
 
   const applyChoice = () => void run(async () => {
     if (!selected || !window.confirm('应用设置会中断当前 CLI 进程并重新续接，是否继续？')) return;
@@ -686,6 +701,7 @@ export function App() {
               onDelete={() => void removeTask()}
               onPause={() => void pauseTask()}
               onResume={() => void resumeTask()}
+              onFollowUp={followUpTask}
               onCancel={() => void cancelTask()}
               onParts={setParts}
               onStart={startParts}
@@ -736,8 +752,8 @@ export function App() {
                 setLiveSessions([]);
               }}
               onLoadDirs={(dir) => client.taskDirs(dir)}
-              onCompleteRequirement={(taskId, leaderAgent) => client.completeRequirement(taskId, leaderAgent)}
-              onPlan={(taskId, leaderAgent) => client.plan(taskId, leaderAgent)}
+              onCompleteRequirement={(taskId, leaderAgent, requirement) => client.completeRequirement(taskId, leaderAgent, requirement)}
+              onPlan={(taskId, leaderAgent, requirement) => client.plan(taskId, leaderAgent, requirement)}
               onLoadModels={async (agentKind) => {
                 if (agentKind === 'codex') {
                   const list = await client.listCodexModels();

@@ -18,11 +18,12 @@ export interface Client {
   deleteTask(id: string): Promise<void>;
   pauseTask(id: string): Promise<void>;
   resumeTask(id: string): Promise<void>;
+  followUpTask(id: string, description: string, round: number): Promise<Task>;
   cancelTask(id: string): Promise<void>;
   taskDirs(dir?: string): Promise<DirListing[]>;
-  plan(taskId: string, agent: Agent): Promise<PartDraft[]>;
-  completeRequirement(taskId: string, agent: Agent): Promise<string>;
-  confirm(taskId: string, parts: Array<{ title: string; description: string; agent: Agent; model?: string; dependsOn?: string; phase?: 'coding' | 'review' | 'test' }>, leaderAgent?: Agent): Promise<void>;
+  plan(taskId: string, agent: Agent, description?: string): Promise<PartDraft[]>;
+  completeRequirement(taskId: string, agent: Agent, description?: string): Promise<string>;
+  confirm(taskId: string, parts: Array<{ title: string; description: string; agent: Agent; model?: string; dependsOn?: string; phase?: 'coding' | 'review' | 'test' }>, leaderAgent?: Agent, draft?: { round: number; description: string }): Promise<void>;
   progress(taskId: string): Promise<PartProgress[]>;
   taskLiveSessions(taskId: string): Promise<TaskLiveSession[]>;
   agentWorkspace(agent: Agent): Promise<WorkspaceInfo>;
@@ -85,11 +86,12 @@ export function createClient(baseUrl = '', fetchImpl: typeof fetch = fetch): Cli
     deleteTask: async (id) => { await callJson(`/api/tasks/${encodeURIComponent(id)}`, 'DELETE'); },
     pauseTask: async (id) => { await callJson(`/api/tasks/${encodeURIComponent(id)}/pause`, 'POST'); },
     resumeTask: async (id) => { await callJson(`/api/tasks/${encodeURIComponent(id)}/resume`, 'POST'); },
+    followUpTask: (id, description, round) => callJson<Task>(`/api/tasks/${encodeURIComponent(id)}/follow-up`, 'POST', { description, round }),
     cancelTask: async (id) => { await callJson(`/api/tasks/${encodeURIComponent(id)}/cancel`, 'POST'); },
-    plan: (taskId, agent) => callJson<PartDraft[]>(`/api/tasks/${taskId}/plan`, 'POST', { agent }),
-    completeRequirement: (taskId, agent) => callJson<{ requirement: string }>(`/api/tasks/${taskId}/complete-requirement`, 'POST', { agent }).then((r) => r.requirement),
-    confirm: async (taskId, parts, leaderAgent) => {
-      await callJson(`/api/tasks/${taskId}/confirm`, 'POST', { parts, leaderAgent });
+    plan: (taskId, agent, description) => callJson<PartDraft[]>(`/api/tasks/${taskId}/plan`, 'POST', { agent, description }),
+    completeRequirement: (taskId, agent, description) => callJson<{ requirement: string }>(`/api/tasks/${taskId}/complete-requirement`, 'POST', { agent, description }).then((r) => r.requirement),
+    confirm: async (taskId, parts, leaderAgent, draft) => {
+      await callJson(`/api/tasks/${taskId}/confirm`, 'POST', { parts, leaderAgent, ...draft });
     },
     taskLiveSessions: (taskId) => callJson<TaskLiveSession[]>(`/api/tasks/${taskId}/live-sessions`, 'GET'),
     progress: (taskId) => callJson<PartProgress[]>(`/api/tasks/${taskId}/progress`, 'GET'),

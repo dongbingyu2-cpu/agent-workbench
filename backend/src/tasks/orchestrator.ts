@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import type { Agent, AgentAdapter, AgentKind, Part, PartStatus } from '../agents/types';
 import { isExternalSessionKind } from '../agents/types';
 import type { PtyProcess, Supervisor } from '../pty/supervisor';
@@ -8,6 +7,7 @@ import type { WsMessage } from '../api/events';
 import type { SessionStore } from '../sessions/eventLog';
 import type { TaskStore } from './store';
 import type { Workspace } from './workspace';
+import { taskBackground, taskSummaryPath } from './context';
 
 export interface PartProgress {
   partId: string;
@@ -144,10 +144,8 @@ export class Orchestrator {
    * task is marked done.
    */
   activateTask(taskId: string, assignments: Array<{ part: Part; agent: Agent }>, leaderAgent?: Agent): void {
-    if (this.doneTasks.has(taskId)) return;
     const task = this.deps.store.getTask(taskId);
-    const background = task?.description ?? '';
-    this.deps.workspace.writeShared(taskId, background);
+    if (!task || task.status !== 'planned') return;
     this.deps.store.updateTaskStatus(taskId, 'active');
     this.taskLeader.set(taskId, leaderAgent);
     this.doneTasks.delete(taskId);
@@ -159,7 +157,7 @@ export class Orchestrator {
       this.deps.store.updatePart(part.id, { status: 'pending' });
     }
     // Dispatch whatever is ready now.
-    for (const { part } of assignments) this.maybeStartPart(taskId, task?.title ?? '', part);
+    for (const { part } of assignments) this.maybeStartPart(taskId, part);
   }
 
   pauseTask(taskId: string): void {
@@ -207,7 +205,7 @@ export class Orchestrator {
         }
       }
       if (this.deps.store.getPart(part.id)?.status === 'pending' && this.dependencySatisfied(taskId, part)) {
-        this.maybeStartPart(taskId, task.title, part);
+        this.maybeStartPart(taskId, part);
       }
     }
     this.emitProgress(taskId);
@@ -244,7 +242,7 @@ export class Orchestrator {
   private dependencySatisfied(taskId: string, part: Part): boolean {
     const parts = this.deps.store.listParts(taskId);
     for (const dependencyTitle of this.dependenciesOf(part)) {
-      const dependency = parts.find((item) => item.title === dependencyTitle);
+      const dependency = parts.find((item) => item.title === dependencyTitle && (item.round ?? 1) === (part.round ?? 1));
       if (!dependency) continue; // unknown dependency is treated as satisfied
       const status = this.deps.store.getPart(dependency.id)?.status;
       if (status !== 'done' && status !== 'failed') return false;
@@ -252,7 +250,7 @@ export class Orchestrator {
     return true;
   }
 
-  private maybeStartPart(taskId: string, _title: string, part: Part): void {
+  private maybeStartPart(taskId: string, part: Part): void {
     if (this.pausedTasks.has(taskId) || this.cancelledTasks.has(taskId)) return;
     if (this.deps.store.getPart(part.id)?.status !== 'pending') return;
     if (!this.dependencySatisfied(taskId, part)) return;
@@ -267,30 +265,30 @@ export class Orchestrator {
     this.deps.store.updatePart(part.id, { status: 'running' });
     this.tails.set(part.id, '');
     const task = this.deps.store.getTask(taskId);
-    const background = task?.description ?? '';
+    const background = task ? taskBackground(task) : '';
     const cwd = task?.workspacePath || agent.cwd || process.cwd();
     const prompt = buildPartPrompt(part, background, task?.workspacePath);
 
-    if (isExternalSessionKind(agent.kind)) {
-      const promptPath = this.deps.workspace.writePrompt(taskId, part.id, prompt);
-      this.tails.set(part.id, `桌面智能体：请在对应客户端执行 ${promptPath}\n完成后写入 ${part.resultPath} 并创建 ${part.doneMarker}`);
-      const unwatch = this.deps.workspace.watchPartCompletion(taskId, part.id, () => {
-        unwatch();
-        if (this.deps.store.getPart(part.id)?.status !== 'running') return;
-        this.deps.store.updatePart(part.id, { status: 'done' });
-        this.afterPartDone(taskId);
-      });
-      this.emitProgress(taskId);
-      return;
-    }
-
-    const adapter = this.deps.adapters(agent.kind);
-    if (this.deps.useOneShot && adapter.oneShot && !this.deps.supervisor.isRunning(agent.id)) {
-      this.runOneShotPart(taskId, part, agent, adapter, prompt, cwd);
-      return;
-    }
-
     try {
+      if (isExternalSessionKind(agent.kind)) {
+        const promptPath = this.deps.workspace.writePrompt(taskId, part.id, prompt);
+        this.tails.set(part.id, `桌面智能体：请在对应客户端执行 ${promptPath}\n完成后写入 ${part.resultPath} 并创建 ${part.doneMarker}`);
+        let unwatch = () => {};
+        unwatch = this.deps.workspace.watchPartCompletion(taskId, part.id, () => {
+          unwatch();
+          if (this.deps.store.getPart(part.id)?.status !== 'running') return;
+          this.deps.store.updatePart(part.id, { status: 'done' });
+          this.afterPartDone(taskId);
+        });
+        this.emitProgress(taskId);
+        return;
+      }
+
+      const adapter = this.deps.adapters(agent.kind);
+      if (this.deps.useOneShot && adapter.oneShot && !this.deps.supervisor.isRunning(agent.id)) {
+        this.runOneShotPart(taskId, part, agent, adapter, prompt, cwd);
+        return;
+      }
       const proc = this.startAgent(agent, agent.sessionId, { model: part.model || undefined, cwd });
       this.busy.add(agent.id);
       this.deps.supervisor.onOutput(agent.id, (chunk) => {
@@ -303,9 +301,14 @@ export class Orchestrator {
         unwatch();
         if (this.deps.store.getPart(part.id)?.status !== 'running') return;
         this.deps.store.updatePart(part.id, { status: 'done' });
-        this.busy.delete(agent.id);
+        // 释放本分工启动的终端，同一智能体随后可接收新分工。
+        try { this.stop(agent.id); } catch { this.busy.delete(agent.id); }
         this.afterPartDone(taskId);
       });
+      if (this.deps.store.getPart(part.id)?.status !== 'running') {
+        unwatch();
+        return;
+      }
       this.activeParts.set(part.id, {
         taskId,
         agentId: agent.id,
@@ -336,18 +339,14 @@ export class Orchestrator {
     const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd.file);
     this.busy.add(agent.id);
 
-    let unwatch: () => void = () => {};
     const finish = (status: 'done' | 'failed') => {
       this.activeParts.delete(part.id);
-      unwatch();
       if (this.pausedTasks.has(taskId) || this.cancelledTasks.has(taskId)) return;
       if (this.deps.store.getPart(part.id)?.status !== 'running') return;
       this.deps.store.updatePart(part.id, { status });
       this.busy.delete(agent.id);
       this.afterPartDone(taskId);
     };
-
-    unwatch = this.deps.workspace.watchPartCompletion(taskId, part.id, () => finish('done'));
 
     try {
       const child = spawn(cmd.file, cmd.args, {
@@ -360,7 +359,7 @@ export class Orchestrator {
         taskId,
         agentId: agent.id,
         kill: () => child.kill(),
-        unwatch,
+        unwatch: () => {},
       });
       const onChunk = (raw: Buffer | string) => {
         const chunk = String(raw);
@@ -380,7 +379,8 @@ export class Orchestrator {
         if (this.deps.store.getPart(part.id)?.status !== 'running') return;
         const hasDone = existsSync(part.doneMarker);
         const hasResult = existsSync(part.resultPath);
-        if (code === 0 && (hasDone || hasResult)) {
+        // CLI 退出后再完成分工，避免新一轮与仍在收尾的进程同时写入工作区。
+        if (hasDone || (code === 0 && hasResult)) {
           if (!hasDone) {
             try { writeFileSync(part.doneMarker, 'done\n', 'utf8'); } catch {}
           }
@@ -403,11 +403,12 @@ export class Orchestrator {
     if (this.pausedTasks.has(taskId) || this.cancelledTasks.has(taskId)) return;
 
     // Start any pending parts whose dependencies are now satisfied.
-    const parts = this.deps.store.listParts(taskId);
     const task = this.deps.store.getTask(taskId);
+    if (!task || task.status !== 'active') return;
+    const parts = task.parts.filter((part) => (part.round ?? 1) === (task.round ?? 1));
     for (const part of parts) {
       if (this.deps.store.getPart(part.id)?.status !== 'pending') continue;
-      if (this.dependencySatisfied(taskId, part)) this.maybeStartPart(taskId, task?.title ?? '', part);
+      if (this.dependencySatisfied(taskId, part)) this.maybeStartPart(taskId, part);
     }
 
     // If every part has finished, drive the leader summary + close-out.
@@ -427,13 +428,13 @@ export class Orchestrator {
     const hasSucceeded = completedParts.some((part) => part.status === 'done');
     if (leader && hasSucceeded && !isExternalSessionKind(leader.kind)) {
       const summaryPrompt = buildLeaderSummaryPrompt(
-        { title: task?.title ?? '', description: task?.description ?? '', workspacePath: task?.workspacePath },
+        { title: task.title, description: task.description, workspacePath: task.workspacePath },
         completedParts,
       );
       const leaderAdapter = this.deps.adapters(leader.kind);
       if (this.deps.useOneShot && leaderAdapter.oneShot && !this.deps.supervisor.isRunning(leader.id)) {
         try {
-          const cwd = task?.workspacePath || leader.cwd || process.cwd();
+          const cwd = task.workspacePath || leader.cwd || process.cwd();
           const cmd = leaderAdapter.oneShot({ prompt: summaryPrompt, cwd, allowWrites: false });
           const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd.file);
           const child = spawn(cmd.file, cmd.args, { cwd, windowsHide: true, shell: isBatch, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -443,9 +444,11 @@ export class Orchestrator {
             summaryOut += text;
             this.deps.sessions.append(leader.id, { ts: Date.now(), type: 'output', data: text });
           });
-          child.on('close', () => {
-            if (summaryOut.trim() && task?.workspacePath) {
-              try { writeFileSync(path.join(task.workspacePath, 'SUMMARY.md'), summaryOut.trim(), 'utf8'); } catch {}
+          child.once('error', () => {});
+          child.on('close', (code) => {
+            if (code === 0 && summaryOut.trim() && task.workspacePath) {
+              // 异步返回的上一轮汇总只能写入自己的文件。
+              try { writeFileSync(taskSummaryPath(task), summaryOut.trim(), 'utf8'); } catch {}
               this.emitProgress(taskId);
             }
           });

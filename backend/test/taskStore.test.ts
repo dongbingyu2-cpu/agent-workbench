@@ -21,4 +21,28 @@ describe('SqliteTaskStore', () => {
     const store = new SqliteTaskStore(openDatabase(':memory:'), new FsWorkspace(mkdtempSync(join(tmpdir(), 'ws-'))));
     expect(() => store.createTask({ title: '  ', description: 'x' })).toThrow(/title/);
   });
+
+  it('treats a saved task from before round tracking as the first round', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ws-'));
+    const file = join(root, 'legacy.db');
+    const workspace = new FsWorkspace(root);
+    const before = openDatabase(file);
+    const oldStore = new SqliteTaskStore(before, workspace);
+    const task = oldStore.createTask({ title: 'Example', description: 'Original request' });
+    const part = oldStore.addPart(task.id, { title: 'First part', description: 'Work', assignedAgentId: null, status: 'done' });
+    oldStore.updateTaskStatus(task.id, 'done');
+    before.exec('ALTER TABLE parts DROP COLUMN round; DROP TABLE task_rounds;');
+    before.close();
+
+    const after = openDatabase(file);
+    try {
+      const migrated = new SqliteTaskStore(after, workspace);
+      expect(migrated.beginFollowUp(task.id, 'Next request')).toMatchObject({
+        round: 2, status: 'planned', previousRequirements: ['Original request'],
+        parts: [{ id: part.id, round: 1, status: 'done' }],
+      });
+    } finally {
+      after.close();
+    }
+  });
 });

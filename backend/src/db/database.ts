@@ -29,5 +29,6 @@ export function openDatabase(dbPath: string): DatabaseSync {
   tryAddColumn(db, 'parts', 'depends_on', 'TEXT');
   tryAddColumn(db, 'parts', 'agent_kind', 'TEXT');
   tryAddColumn(db, 'parts', 'phase', 'TEXT');
+  tryAddColumn(db, 'parts', 'round', 'INTEGER NOT NULL DEFAULT 1');
   return db;
 }

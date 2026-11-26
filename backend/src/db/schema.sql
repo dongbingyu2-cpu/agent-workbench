@@ -7,6 +7,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   leader_agent_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_rounds (
+  task_id TEXT NOT NULL,
+  round INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  PRIMARY KEY (task_id, round)
+);
+
 CREATE TABLE IF NOT EXISTS parts (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
@@ -19,5 +26,6 @@ CREATE TABLE IF NOT EXISTS parts (
   model TEXT,
   depends_on TEXT,
   agent_kind TEXT,
-  phase TEXT
+  phase TEXT,
+  round INTEGER NOT NULL DEFAULT 1
 );

@@ -45,6 +45,7 @@ export type PartPhase = 'coding' | 'review' | 'test';
 export interface Part {
   id: string;
   taskId: string;
+  round?: number;
   title: string;
   description: string;
   assignedAgentId: string | null;
@@ -61,6 +62,8 @@ export interface Part {
 
 export interface Task {
   id: string;
+  round?: number;
+  previousRequirements?: string[];
   title: string;
   description: string;
   workspacePath: string;

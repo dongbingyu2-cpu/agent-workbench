@@ -102,6 +102,24 @@ it('allows dispatching when two parts share the same agent', () => {
   expect(onStart).toHaveBeenCalledTimes(1);
 });
 
+it('lets a completed task submit the next requirement and retains the draft on failure', async () => {
+  const onFollowUp = vi.fn<(taskId: string, note: string, round: number) => Promise<void>>()
+    .mockRejectedValueOnce(new Error('追加未保存'))
+    .mockResolvedValueOnce(undefined);
+  const task = { id: 't', title: 'Example', description: 'Initial work', workspacePath: '', status: 'done', parts: [], round: 2 } as const;
+  render(<TaskPanel {...makeProps({ task: { ...task, parts: [] }, onFollowUp })} />);
+  const prompt = screen.getByRole('textbox', { name: '追加任务要求' });
+  const submit = screen.getByRole('button', { name: '开始下一轮' });
+  expect(submit).toBeDisabled();
+  fireEvent.change(prompt, { target: { value: ' Add a review ' } });
+  fireEvent.click(submit);
+  expect(await screen.findByText('追加未保存')).toBeInTheDocument();
+  expect(prompt).toHaveValue(' Add a review ');
+  fireEvent.keyDown(prompt, { key: 'Enter' });
+  await waitFor(() => expect(onFollowUp).toHaveBeenCalledTimes(2));
+  expect(onFollowUp).toHaveBeenLastCalledWith('t', 'Add a review', 2);
+});
+
 it('reflects live part progress in the overview and task tree', () => {
   const task = {
     id: 't1',

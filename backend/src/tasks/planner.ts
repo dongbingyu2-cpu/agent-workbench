@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import type { Agent, AgentAdapter, AgentKind, OneShotCommand, Task } from '../agents/types';
 import { isExternalSessionKind } from '../agents/types';
 import type { PtyProcess, Supervisor } from '../pty/supervisor';
+import { taskBackground } from './context';
 
 export interface PartDraft {
   title: string;
@@ -120,7 +121,7 @@ function promptFor(task: Task): string {
     `You are the planning assistant. Break the following task into 2-4 concrete parts.`,
     ...(task.workspacePath ? [`Workspace directory: ${task.workspacePath}`] : []),
     `Task: ${task.title}`,
-    `Background: ${task.description}`,
+    `Background: ${taskBackground(task)}`,
     `Reply with ONLY a JSON array of objects {"title","description","phase","suggestedAgentId","dependsOn","model"}.`,
     `- phase is one of coding|review|test.`,
     `- coding parts should ONLY write/modify code (no running tests, builds, browser checks, or screenshots; put verification in a separate test/review part if needed).`,
@@ -134,7 +135,8 @@ function requirementPromptFor(task: Task): string {
   return [
     `You are the leader agent. Below is a rough requirement sketch.`,
     ...(task.workspacePath ? [`Workspace directory: ${task.workspacePath}`] : []),
-    `Sketch: ${task.title}\n${task.description}`,
+    `Sketch: ${task.title}\n${taskBackground(task)}`,
+    ...((task.round ?? 1) > 1 ? ['Refine only the current requirement. Earlier requests and results are context.'] : []),
     `Write a concise, clear requirement spec in Chinese: goal, deliverables, and acceptance criteria.`,
     `Reply with ONLY a JSON object {"requirement":"${REQUIREMENT_PLACEHOLDER}"}.`,
     `No prose outside the JSON.`,

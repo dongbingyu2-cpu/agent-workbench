@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildServer } from '../src/server';
@@ -9,7 +9,7 @@ import { SqliteTaskStore } from '../src/tasks/store';
 import { Orchestrator } from '../src/tasks/orchestrator';
 import { JsonlSessionStore } from '../src/sessions/eventLog';
 import { loadConfig } from '../src/config';
-import type { AgentAdapter } from '../src/agents/types';
+import type { AgentAdapter, Task } from '../src/agents/types';
 
 const agentFixture = {
   id: 'a1',
@@ -30,7 +30,7 @@ const adapter: AgentAdapter = {
   launch: () => ({ file: 'claude', args: [] }),
 };
 
-function testDeps() {
+function testDeps(watch: ConstructorParameters<typeof FsWorkspace>[1] = () => () => {}) {
   const root = mkdtempSync(join(tmpdir(), 'api-'));
   const fakeProc = () => ({ pid: 1, write: () => {}, onData: () => {}, onExit: () => {}, kill: () => {} });
   const supervisor = {
@@ -40,7 +40,7 @@ function testDeps() {
     isRunning: () => true,
     stop: () => {},
   } as any;
-  const workspace = new FsWorkspace(root, () => () => {});
+  const workspace = new FsWorkspace(root, watch);
   const store = new SqliteTaskStore(openDatabase(':memory:'), workspace);
   const sessions = new JsonlSessionStore(root);
   const orchestrator = new Orchestrator({ supervisor, store, workspace, sessions, adapters: () => adapter });
@@ -117,6 +117,70 @@ describe('REST API', () => {
       payload: { parts: [{ title: 'A', description: 'a', agent: agentFixture }, { title: 'B', description: 'b', agent: agentFixture }] },
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  it('opens a new round in the same task and runs only its new parts', async () => {
+    const callbacks = new Map<string, (name: string) => void>();
+    const deps = testDeps((dir, onMarker) => {
+      callbacks.set(dir, onMarker);
+      return () => { callbacks.delete(dir); };
+    });
+    const app = buildServer(deps);
+    try {
+      const task = deps.store.createTask({ title: 'Example', description: 'First requirement' });
+      const url = `/api/tasks/${task.id}`;
+      const post = (operation: string, payload: Record<string, unknown>) =>
+        app.inject({ method: 'POST', url: `${url}/${operation}`, payload });
+      const finishPart = (partId: string, output: string) => {
+        const part = deps.store.getPart(partId)!;
+        writeFileSync(part.resultPath, output);
+        callbacks.get(join(task.workspacePath, 'parts', partId))?.('DONE');
+      };
+
+      const primary = { title: 'Implementation', description: 'Implement', agent: agentFixture };
+      expect((await post('follow-up', { description: 'Too early', round: 1 })).statusCode).toBe(409);
+      expect((await post('confirm', { round: 1, parts: [primary] })).statusCode).toBe(200);
+      const first = deps.store.listParts(task.id)[0]!;
+      finishPart(first.id, 'First result');
+      expect(deps.store.getTask(task.id)?.status).toBe('done');
+      writeFileSync(join(task.workspacePath, 'SUMMARY.md'), 'First summary');
+
+      expect((await post('follow-up', { description: ' ', round: 1 })).statusCode).toBe(400);
+      const submissions = await Promise.all([
+        post('follow-up', { description: 'Second requirement', round: 1 }),
+        post('follow-up', { description: 'Second requirement', round: 1 }),
+      ]);
+      expect(submissions.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+      const reopened = submissions.find((response) => response.statusCode === 200)!.json<Task>();
+      expect(reopened).toMatchObject({
+        id: task.id, workspacePath: task.workspacePath, round: 2, status: 'planned',
+        description: 'Second requirement', previousRequirements: ['First requirement'],
+      });
+      expect(reopened.parts).toMatchObject([{ id: first.id, round: 1, status: 'done' }]);
+      expect((await app.inject({ url: `${url}/workspace` })).json().summary).toBe('');
+      expect((await post('confirm', { round: 1, parts: [primary] })).statusCode).toBe(409);
+      expect((await post('confirm', {
+        round: 2,
+        parts: [primary, { title: 'Review', description: 'Review new work', agent: agentFixture, dependsOn: primary.title }],
+      })).statusCode).toBe(200);
+      const [, implementation, review] = deps.store.listParts(task.id);
+      expect(implementation).toMatchObject({ round: 2, status: 'running' });
+      expect(review).toMatchObject({ round: 2, status: 'pending' });
+      const shared = readFileSync(join(task.workspacePath, 'SHARED.md'), 'utf8');
+      expect(shared).toContain('Current requirement (round 2):\nSecond requirement');
+      expect(shared).toContain(first.resultPath);
+      finishPart(implementation!.id, 'Second result');
+      expect(deps.store.getPart(review!.id)?.status).toBe('running');
+      finishPart(review!.id, 'Review result');
+      expect(deps.store.getTask(task.id)?.status).toBe('done');
+      expect(readFileSync(first.resultPath, 'utf8')).toBe('First result');
+      expect((await post('follow-up', { description: 'Third requirement', round: 1 })).statusCode).toBe(409);
+      expect((await post('follow-up', { description: 'Third requirement', round: 2 })).json()).toMatchObject({
+        round: 3, previousRequirements: ['First requirement', 'Second requirement'],
+      });
+    } finally {
+      await app.close();
+    }
   });
 
   it('lists a directory for an agent workspace', async () => {

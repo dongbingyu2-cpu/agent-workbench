@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AgentKind, Part, PartPhase, PartStatus, Task, TaskStatus } from '../agents/types';
+import { taskBackground } from './context';
 import type { Workspace } from './workspace';
+
+type NewPart = Pick<Part, 'title' | 'description' | 'assignedAgentId' | 'status' | 'agentKind' | 'phase' | 'model' | 'dependsOn'>;
 
 export interface TaskStore {
   createTask(input: { title: string; description: string; workspacePath?: string }): Task;
@@ -10,20 +13,10 @@ export interface TaskStore {
   updateTaskStatus(id: string, status: TaskStatus): void;
   updateTaskLeader(id: string, leaderAgentId: string | null): void;
   updateTaskDescription?(id: string, description: string): void;
+  beginFollowUp(id: string, description: string): Task | undefined;
   deleteTask(id: string): void;
-  addPart(
-    taskId: string,
-    input: {
-      title: string;
-      description: string;
-      assignedAgentId: string | null;
-      agentKind?: AgentKind | null;
-      phase?: PartPhase | null;
-      status: PartStatus;
-      model?: string | null;
-      dependsOn?: string | null;
-    },
-  ): Part;
+  addPart(taskId: string, input: NewPart): Part;
+  confirmRound(taskId: string, round: number, inputs: NewPart[], leaderAgentId?: string, description?: string): Part[] | undefined;
   getPart(id: string): Part | undefined;
   listParts(taskId: string): Part[];
   updatePart(id: string, patch: Partial<Pick<Part, 'status' | 'assignedAgentId'>>): void;
@@ -51,12 +44,14 @@ interface PartRow {
   depends_on: string | null;
   agent_kind: string | null;
   phase: string | null;
+  round: number;
 }
 
 function toPart(row: PartRow): Part {
   return {
     id: row.id,
     taskId: row.task_id,
+    round: row.round,
     title: row.title,
     description: row.description,
     assignedAgentId: row.assigned_agent_id,
@@ -78,10 +73,15 @@ export class SqliteTaskStore implements TaskStore {
 
   private toTask(row: TaskRow): Task {
     this.workspace.registerTaskDir?.(row.id, row.workspace_path);
+    const rounds = this.db.prepare('SELECT round, description FROM task_rounds WHERE task_id = ? ORDER BY round')
+      .all(row.id) as Array<{ round: number; description: string }>;
+    const current = rounds.at(-1);
     return {
       id: row.id,
       title: row.title,
-      description: row.description,
+      description: current?.description ?? row.description,
+      round: current?.round ?? 1,
+      ...(current ? { previousRequirements: [row.description, ...rounds.slice(0, -1).map((item) => item.description)] } : {}),
       workspacePath: row.workspace_path,
       status: row.status as TaskStatus,
       parts: this.listParts(row.id),
@@ -99,7 +99,7 @@ export class SqliteTaskStore implements TaskStore {
     this.db
       .prepare('INSERT INTO tasks (id, title, description, workspace_path, status) VALUES (?, ?, ?, ?, ?)')
       .run(id, title, input.description, workspacePath, 'planned');
-    return { id, title, description: input.description, workspacePath, status: 'planned', parts: [] };
+    return { id, title, description: input.description, workspacePath, status: 'planned', round: 1, parts: [] };
   }
 
   getTask(id: string): Task | undefined {
@@ -121,31 +121,66 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   updateTaskDescription(id: string, description: string): void {
-    this.db.prepare('UPDATE tasks SET description = ? WHERE id = ?').run(description, id);
+    const current = this.db.prepare('UPDATE task_rounds SET description = ? WHERE task_id = ? AND round = (SELECT MAX(round) FROM task_rounds WHERE task_id = ?)')
+      .run(description, id, id);
+    if (!current.changes) this.db.prepare('UPDATE tasks SET description = ? WHERE id = ?').run(description, id);
+  }
+
+  beginFollowUp(id: string, description: string): Task | undefined {
+    this.db.exec('BEGIN IMMEDIATE');
+    let applied = false;
+    try {
+      // 状态切换和新一轮需求一起写入，重复提交只会成功一次。
+      applied = Boolean(this.db.prepare("UPDATE tasks SET status = 'planned' WHERE id = ? AND status = 'done'").run(id).changes);
+      if (applied) {
+        this.db.prepare('INSERT INTO task_rounds (task_id, round, description) SELECT ?, COALESCE(MAX(round), 1) + 1, ? FROM task_rounds WHERE task_id = ?')
+          .run(id, description, id);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return applied ? this.getTask(id) : undefined;
   }
 
   deleteTask(id: string): void {
     this.db.prepare('DELETE FROM parts WHERE task_id = ?').run(id);
+    this.db.prepare('DELETE FROM task_rounds WHERE task_id = ?').run(id);
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
   }
 
-  addPart(taskId: string, input: {
-    title: string;
-    description: string;
-    assignedAgentId: string | null;
-    agentKind?: AgentKind | null;
-    phase?: PartPhase | null;
-    status: PartStatus;
-    model?: string | null;
-    dependsOn?: string | null;
-  }): Part {
+  confirmRound(taskId: string, round: number, inputs: NewPart[], leaderAgentId?: string, description?: string): Part[] | undefined {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTask(taskId);
+      if (!task || task.status !== 'planned' || (task.round ?? 1) !== round || task.parts.some((part) => (part.round ?? 1) === round)) {
+        this.db.exec('ROLLBACK');
+        return undefined;
+      }
+      // 先准备本轮文件。工作区不可写时回滚分工，保留待派发状态供重试。
+      const parts = inputs.map((input) => this.addPart(taskId, input));
+      if (leaderAgentId) this.updateTaskLeader(taskId, leaderAgentId);
+      if (description !== undefined) this.updateTaskDescription(taskId, description);
+      this.workspace.writeShared(taskId, taskBackground({ ...task, description: description ?? task.description }));
+      this.db.exec('COMMIT');
+      return parts;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  addPart(taskId: string, input: NewPart): Part {
     const id = randomUUID();
+    const { round } = this.db.prepare('SELECT COALESCE(MAX(round), 1) AS round FROM task_rounds WHERE task_id = ?')
+      .get(taskId) as { round: number };
     this.workspace.ensureTaskDir(taskId);
     const resultPath = this.workspace.resultPath(taskId, id);
     const doneMarker = this.workspace.donePath(taskId, id);
     this.db
       .prepare(
-        'INSERT INTO parts (id, task_id, title, description, assigned_agent_id, status, result_path, done_marker, model, depends_on, agent_kind, phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO parts (id, task_id, title, description, assigned_agent_id, status, result_path, done_marker, model, depends_on, agent_kind, phase, round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -160,10 +195,12 @@ export class SqliteTaskStore implements TaskStore {
         input.dependsOn ?? null,
         input.agentKind ?? null,
         input.phase ?? null,
+        round,
       );
     return {
       id,
       taskId,
+      round,
       title: input.title,
       description: input.description,
       assignedAgentId: input.assignedAgentId,
